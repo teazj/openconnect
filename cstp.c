@@ -265,6 +265,8 @@ static int start_cstp_connection(struct openconnect_info *vpninfo)
 	/* Explicitly request the same IPv4 and/or IPv6 addresses on reconnect */
 	if (old_addr)
 		buf_append(reqbuf, "X-CSTP-Address: %s\r\n", old_addr);
+	if (old_addr6)
+		buf_append(reqbuf, "X-CSTP-Address: %s\r\n", old_addr6);
 	if (!vpninfo->disable_ipv6)
 		buf_append(reqbuf, "X-CSTP-Full-IPv6-Capability: true\r\n");
 #ifdef HAVE_DTLS
