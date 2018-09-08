@@ -46,7 +46,8 @@ void gpst_common_headers(struct openconnect_info *vpninfo,
  * use in the auth form; pw_or_cookie_field is NOT stolen.
  */
 static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
-                                          char *prompt, char *auth_id, char *username, char *pw_or_cookie_field)
+                                          char *prompt, char *auth_id, char *username, char *pw_or_cookie_field,
+                                          char *username_label, char *password_label)
 {
 	struct oc_auth_form *form;
 	struct oc_form_opt *opt, *opt2;
@@ -64,7 +65,8 @@ static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
 		return NULL;
 	}
 	opt->name = strdup("user");
-	opt->label = strdup(_("Username: "));
+	if (asprintf(&opt->label, "%s: ", username_label ? : _("Username: ")) == 0)
+		return NULL;
 	opt->type = username ? OC_FORM_OPT_HIDDEN : OC_FORM_OPT_TEXT;
 	opt->_value = username;
 
@@ -72,7 +74,7 @@ static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
 	if (!opt2)
 		goto nomem;
 	opt2->name = strdup(pw_or_cookie_field ? : "passwd");
-	if (asprintf(&opt2->label, "%s: ", auth_id ? _("Challenge") : (pw_or_cookie_field ? : _("Password"))) == 0)
+	if (asprintf(&opt2->label, "%s: ", auth_id ? _("Challenge") : (pw_or_cookie_field ? : (password_label ? :_("Password")))) == 0)
 		return NULL;
 
 	/* XX: Some VPNs use a password in the first form, followed by a
@@ -83,6 +85,9 @@ static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
 	else
 		opt2->type = OC_FORM_OPT_PASSWORD;
 
+	vpn_progress(vpninfo, PRG_TRACE, "Form %s: \"%s\" %s=%s, \"%s\" %s=%s\n",
+	             form->auth_id, opt->label, opt->name, opt->_value, opt2->label, opt2->name, opt2->_value);
+
 	return form;
 }
 
@@ -92,18 +97,61 @@ static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
 static int challenge_cb(struct openconnect_info *vpninfo, char *prompt, char *inputStr, void *cb_data)
 {
 	struct oc_auth_form **out_form = cb_data;
-	struct oc_auth_form *form = *out_form;
-	char *username;
+	*out_form = new_auth_form(vpninfo, prompt, inputStr, NULL, NULL, NULL, NULL);
+	return (*out_form) ? -EAGAIN : -ENOMEM;
+}
 
-	/* Steal and reuse username from existing form */
-	username = form->opts ? form->opts->_value : NULL;
-	form->opts->_value = NULL;
-	free_auth_form(form);
-	form = *out_form = new_auth_form(vpninfo, prompt, inputStr, username, NULL);
-	if (!form)
-		return -ENOMEM;
+/* Parse pre-login response ({POST,GET} /{global-protect,ssl-vpn}/pre-login.esp)
+ *
+ * Extracts the relevant arguments from the XML (username-label, password-label)
+ * and uses them to build an auth form, which always has two visible fields:
+ *
+ *   1) username
+ *   2) one secret value:
+ *       - normal account password
+ *       - "challenge" (2FA) password, along with form name in auth_id
+ *       - cookie from external authentication flow ("alternative secret" INSTEAD OF password)
+ *
+ */
+static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_node, void *cb_data)
+{
+	struct oc_auth_form **out_form = cb_data;
+	char *prompt = NULL, *username_label = NULL, *password_label = NULL, *saml_path = NULL;
+	char *s = NULL;
+	int result = -EINVAL;
 
-	return -EAGAIN;
+	if (!xmlnode_is_named(xml_node, "prelogin-response"))
+		goto out;
+
+	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
+		if (!xmlnode_get_val(xml_node, "saml-auth-method", &s)) {
+			if (strcmp(s, "REDIRECT"))
+				vpn_progress(vpninfo, PRG_DEBUG, "Unexpected SAML method %s (expected REDIRECT)\n", s);
+		} else if (!xmlnode_get_val(xml_node, "saml-request", &s)) {
+			int len;
+			saml_path = openconnect_base64_decode(&len, s);
+			if (len < 0) {
+				vpn_progress(vpninfo, PRG_ERR, "Could not decode SAML request as base64: %s\n", s);
+				result = -EINVAL;
+			} else
+				vpn_progress(vpninfo, PRG_INFO, "SAML login is required: %.*s\n", len, saml_path);
+		} else {
+			xmlnode_get_val(xml_node, "authentication-message", &prompt);
+			xmlnode_get_val(xml_node, "username-label", &username_label);
+			xmlnode_get_val(xml_node, "password-label", &password_label);
+			/* XX: should we save the certificate username from <ccusername/> ? */
+		}
+	}
+	free(s);
+
+	*out_form = new_auth_form(vpninfo, prompt, NULL, NULL, NULL, username_label, password_label);
+	result = (*out_form) ? 0 : -ENOMEM;
+out:
+	free(prompt);
+	free(username_label);
+	free(password_label);
+	free(saml_path);
+	return result;
 }
 
 /* Parse gateway login response (POST /ssl-vpn/login.esp)
@@ -370,19 +418,27 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 	}
 #endif
 
-
 	/* Ask the user to fill in the auth form; repeat as necessary */
 	for (;;) {
-		if (!form)
-			form = new_auth_form(vpninfo, NULL, NULL, NULL, pw_or_cookie_field);
-		if (!form)
-			return -ENOMEM;
+		/* submit prelogin request to get form */
+		orig_path = vpninfo->urlpath;
+		vpninfo->urlpath = strdup(portal ? "global-protect/prelogin.esp" : "ssl-vpn/prelogin.esp");
+		result = do_https_request(vpninfo, "POST", NULL, NULL, &xml_buf, 0);
+		free(vpninfo->urlpath);
+		vpninfo->urlpath = orig_path;
 
+		if (result >= 0)
+			result = gpst_xml_or_error(vpninfo, xml_buf, parse_prelogin_xml, NULL, &form);
+		if (result)
+			goto out;
+
+	got_form:
 		/* process auth form */
 		result = process_auth_form(vpninfo, form);
 		if (result)
 			goto out;
 
+	replay_form:
 		/* generate token code if specified */
 		result = do_gen_tokencode(vpninfo, form);
 		if (result) {
@@ -418,15 +474,22 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 									   challenge_cb, &form);
 		if (result == -EAGAIN) {
 			/* New form is already populated from the challenge */
-			continue;
+			goto got_form;
 		} else if (result == -EACCES) {
 			/* Invalid username/password; reuse same form, but blank */
 			nuke_opt_values(form->opts);
+			goto got_form;
 		} else if (portal && result == 0) {
-			/* Portal login succeeded; now login to gateway */
+			/* Portal login succeeded; reuse same credentials to login to gateway,
+			 * unless it was a challenge auth form, or used an alternative secret,
+			 * in which case we treat as a new form. */
 			portal = 0;
-			free_auth_form(form);
-			form = NULL;
+			if (form->auth_id && form->auth_id[0] != '_')
+				goto got_form;
+			else if (strcmp(form->opts->next->name, "passwd") != 0)
+				goto got_form;
+			else
+				goto replay_form;
 		} else
 			break;
 	}
