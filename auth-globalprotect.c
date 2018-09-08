@@ -86,9 +86,12 @@ static struct oc_auth_form *auth_form(struct openconnect_info *vpninfo,
 	return form;
 }
 
-/* Return value:
- *  < 0, on error
- *  = 0, on success; *form is populated
+/* Parse gateway login response (POST /ssl-vpn/login.esp)
+ *
+ * Extracts the relevant arguments from the XML (<jnlp><application-desc><argument>...</argument></application-desc></jnlp>)
+ * and uses them to build a query string fragment which is usable for subsequent requests.
+ * This query string fragement is saved as vpninfo->cookie.
+ *
  */
 struct gp_login_arg {
 	const char *opt;
@@ -185,6 +188,13 @@ err_out:
 	return -EINVAL;
 }
 
+/* Parse portal login/config response (POST /ssl-vpn/getconfig.esp)
+ *
+ * Extracts the list of gateways from the XML, writes them to the XML config,
+ * presents the user with a form to choose the gateway, and redirects
+ * to that gateway.
+ *
+ */
 static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node)
 {
 	struct oc_auth_form *form;
@@ -316,6 +326,12 @@ out:
 	return result;
 }
 
+/* Main login entry point
+ *
+ * portal: 0 for gateway login, 1 for portal login
+ * pw_or_cookie_field: "alternate secret" field (see new_auth_form)
+ *
+ */
 static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_cookie_field)
 {
 	int result;
@@ -420,7 +436,8 @@ int gpst_obtain_cookie(struct openconnect_info *vpninfo)
 	char *pw_or_cookie_field = NULL;
 	int result;
 
-	/* An alternate password/secret field may be specified in the "URL path". Known possibilities:
+	/* An alternate password/secret field may be specified in the "URL path" (or --usergroup).
+        * Known possibilities are:
 	 *     /portal:portal-userauthcookie
 	 *     /gateway:prelogin-cookie
 	 */
