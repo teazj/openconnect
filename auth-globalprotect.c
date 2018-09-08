@@ -75,8 +75,9 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 			if (len < 0) {
 				vpn_progress(vpninfo, PRG_ERR, "Could not decode SAML request as base64: %s\n", s);
 				result = -EINVAL;
-			} else
-				vpn_progress(vpninfo, PRG_INFO, "SAML login is required: %.*s\n", len, saml_path);
+			}
+			saml_path = realloc(saml_path, len+1);
+			saml_path[len] = '\0';
 		} else {
 			xmlnode_get_val(xml_node, "authentication-message", &prompt);
 			xmlnode_get_val(xml_node, "username-label", &username_label);
@@ -95,6 +96,8 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 		result = -ENOMEM;
 		goto out;
 	}
+	if (saml_path && asprintf(&form->banner, _("SAML login is required. Visit this URL:\n\t%s"), saml_path) == 0)
+		goto nomem;
 	form->message = prompt ? : strdup(_("Please enter your username and password"));
 	prompt = NULL;
 	form->auth_id = strdup("_login");
