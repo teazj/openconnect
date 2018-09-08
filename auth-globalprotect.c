@@ -425,7 +425,7 @@ out:
  */
 static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login_context *ctx)
 {
-	int result;
+	int result, blind_retry = 0;
 	struct oc_text_buf *request_body = buf_alloc();
 	const char *request_body_type = "application/x-www-form-urlencoded";
 	char *xml_buf = NULL, *orig_path;
@@ -494,9 +494,14 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 			result = gpst_xml_or_error(vpninfo, xml_buf, portal ? parse_portal_xml : parse_login_xml,
 									   challenge_cb, ctx);
 		if (result == -EACCES) {
-			/* Invalid username/password; reuse same form, but blank */
+			/* Invalid username/password; reuse same form, but blank,
+			 * unless we just did a blind retry.
+			 */
 			nuke_opt_values(ctx->form->opts);
-			goto got_form;
+			if (!blind_retry)
+				goto got_form;
+			else
+				blind_retry = 0;
 		} else {
 			/* Save successful username */
 			if (!ctx->username)
@@ -510,9 +515,8 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login
 				 */
 				portal = 0;
 				if (ctx->form->auth_id[0] == '_' && ctx->alt_secret) {
+					blind_retry = 1;
 					goto replay_form;
-				else
-					goto new_form;
 				}
 			} else
 			  break;
