@@ -24,6 +24,12 @@
 
 #include "openconnect-internal.h"
 
+struct login_context {
+	char *username;				/* Username that has already succeeded in some form */
+	char *alt_secret;			/* Alternative secret (DO NOT FREE) */
+	struct oc_auth_form *form;
+};
+
 void gpst_common_headers(struct openconnect_info *vpninfo,
 			 struct oc_text_buf *buf)
 {
@@ -33,72 +39,6 @@ void gpst_common_headers(struct openconnect_info *vpninfo,
 	http_common_headers(vpninfo, buf);
 
 	vpninfo->useragent = orig_ua;
-}
-
-/* The GlobalProtect auth form always has two visible fields:
- *   1) username
- *   2) one secret value:
- *       - normal account password
- *       - "challenge" (2FA) password, along with form name in auth_id
- *       - cookie from external authentication flow (INSTEAD OF password)
- *
- * This function steals the value of username for
- * use in the auth form; pw_or_cookie_field is NOT stolen.
- */
-static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
-                                          char *prompt, char *auth_id, char *username, char *pw_or_cookie_field,
-                                          char *username_label, char *password_label)
-{
-	struct oc_auth_form *form;
-	struct oc_form_opt *opt, *opt2;
-
-	form = calloc(1, sizeof(*form));
-	if (!form)
-		return NULL;
-	form->message = strdup(prompt ? : _("Please enter your username and password"));
-	form->auth_id = strdup(auth_id ? : "_login");
-
-	opt = form->opts = calloc(1, sizeof(*opt));
-	if (!opt) {
-	nomem:
-		free_auth_form(form);
-		return NULL;
-	}
-	opt->name = strdup("user");
-	if (asprintf(&opt->label, "%s: ", username_label ? : _("Username: ")) == 0)
-		return NULL;
-	opt->type = username ? OC_FORM_OPT_HIDDEN : OC_FORM_OPT_TEXT;
-	opt->_value = username;
-
-	opt2 = opt->next = calloc(1, sizeof(*opt));
-	if (!opt2)
-		goto nomem;
-	opt2->name = strdup(pw_or_cookie_field ? : "passwd");
-	if (asprintf(&opt2->label, "%s: ", auth_id ? _("Challenge") : (pw_or_cookie_field ? : (password_label ? :_("Password")))) == 0)
-		return NULL;
-
-	/* XX: Some VPNs use a password in the first form, followed by a
-	 * a token in the second ("challenge") form. Others use only a
-	 * token. How can we distinguish these? */
-	if (!can_gen_tokencode(vpninfo, form, opt2))
-		opt2->type = OC_FORM_OPT_TOKEN;
-	else
-		opt2->type = OC_FORM_OPT_PASSWORD;
-
-	vpn_progress(vpninfo, PRG_TRACE, "Form %s: \"%s\" %s=%s, \"%s\" %s=%s\n",
-	             form->auth_id, opt->label, opt->name, opt->_value, opt2->label, opt2->name, opt2->_value);
-
-	return form;
-}
-
-/* Callback function to create a new form from a challenge
- *
- */
-static int challenge_cb(struct openconnect_info *vpninfo, char *prompt, char *inputStr, void *cb_data)
-{
-	struct oc_auth_form **out_form = cb_data;
-	*out_form = new_auth_form(vpninfo, prompt, inputStr, NULL, NULL, NULL, NULL);
-	return (*out_form) ? -EAGAIN : -ENOMEM;
 }
 
 /* Parse pre-login response ({POST,GET} /{global-protect,ssl-vpn}/pre-login.esp)
@@ -115,10 +55,12 @@ static int challenge_cb(struct openconnect_info *vpninfo, char *prompt, char *in
  */
 static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_node, void *cb_data)
 {
-	struct oc_auth_form **out_form = cb_data;
+	struct login_context *ctx = cb_data;
+	struct oc_auth_form *form = ctx->form;
+	struct oc_form_opt *opt, *opt2;
 	char *prompt = NULL, *username_label = NULL, *password_label = NULL, *saml_path = NULL;
 	char *s = NULL;
-	int result = -EINVAL;
+	int result = 0;
 
 	if (!xmlnode_is_named(xml_node, "prelogin-response"))
 		goto out;
@@ -144,14 +86,95 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	}
 	free(s);
 
-	*out_form = new_auth_form(vpninfo, prompt, NULL, NULL, NULL, username_label, password_label);
-	result = (*out_form) ? 0 : -ENOMEM;
+	/* Replace old form */
+	free_auth_form(ctx->form);
+	form = ctx->form = calloc(1, sizeof(*form));
+	if (!form) {
+	nomem:
+		free_auth_form(form);
+		result = -ENOMEM;
+		goto out;
+	}
+	form->message = prompt ? : strdup(_("Please enter your username and password"));
+	prompt = NULL;
+	form->auth_id = strdup("_login");
+
+	/* First field (username) */
+	opt = form->opts = calloc(1, sizeof(*opt));
+	if (!opt)
+		goto nomem;
+	opt->name = strdup("user");
+	if (asprintf(&opt->label, "%s: ", username_label ? : _("Username")) == 0)
+		goto nomem;
+	if (!ctx->username)
+		opt->type = OC_FORM_OPT_TEXT;
+	else {
+		opt->type = OC_FORM_OPT_HIDDEN;
+		opt->_value = ctx->username;
+		ctx->username = NULL;
+	}
+
+	/* Second field (secret) */
+	opt2 = opt->next = calloc(1, sizeof(*opt));
+	if (!opt2)
+		goto nomem;
+	opt2->name = strdup(ctx->alt_secret ? : "passwd");
+	if (asprintf(&opt2->label, "%s: ", ctx->alt_secret ? : password_label ? : _("Password")) == 0)
+		goto nomem;
+
+	/* XX: Some VPNs use a password in the first form, followed by a
+	 * a token in the second ("challenge") form. Others use only a
+	 * token. How can we distinguish these? */
+	if (!can_gen_tokencode(vpninfo, form, opt2))
+		opt2->type = OC_FORM_OPT_TOKEN;
+	else
+		opt2->type = OC_FORM_OPT_PASSWORD;
+
+	vpn_progress(vpninfo, PRG_TRACE, "%s%s: \"%s\" %s(%s)=%s, \"%s\" %s(%s)\n",
+				 form->auth_id[0] == '_' ? "Login form" : "Challenge form ",
+				 form->auth_id[0] != '_' ? form->auth_id : "",
+				 opt->label, opt->name, opt->type == OC_FORM_OPT_TEXT ? "TEXT" : "HIDDEN", opt->_value,
+				 opt2->label, opt2->name, opt2->type == OC_FORM_OPT_PASSWORD ? "PASSWORD" : "TOKEN");
+
 out:
 	free(prompt);
 	free(username_label);
 	free(password_label);
 	free(saml_path);
 	return result;
+}
+
+/* Callback function to create a new form from a challenge
+ *
+ */
+static int challenge_cb(struct openconnect_info *vpninfo, char *prompt, char *inputStr, void *cb_data)
+{
+	struct login_context *ctx = cb_data;
+	struct oc_auth_form *form = ctx->form;
+	struct oc_form_opt *opt = form->opts, *opt2 = form->opts->next;
+
+	/* Replace prompt, inputStr, and password prompt;
+	 * clear password field, and make user field hidden.
+	 */
+	free(form->message);
+	free(form->auth_id);
+	free(opt2->label);
+	free(opt2->_value);
+	opt2->_value = NULL;
+	opt->type = OC_FORM_OPT_HIDDEN;
+
+	if (    !(form->message = strdup(prompt))
+		 || !(form->auth_id = strdup(inputStr))
+		 || !(opt2->label = strdup(_("Challenge: "))) )
+		return -ENOMEM;
+
+	vpn_progress(vpninfo, PRG_TRACE, "%s%s: \"%s\" %s(%s)=%s, \"%s\" %s(%s)\n",
+				 form->auth_id[0] == '_' ? "Login form" : "Challenge form ",
+				 form->auth_id[0] != '_' ? form->auth_id : "",
+				 opt->label, opt->name, opt->type == OC_FORM_OPT_TEXT ? "TEXT" : "HIDDEN", opt->_value,
+				 opt2->label, opt2->name, opt2->type == OC_FORM_OPT_PASSWORD ? "PASSWORD" : "TOKEN");
+
+	return -EAGAIN;
 }
 
 /* Parse gateway login response (POST /ssl-vpn/login.esp)
@@ -397,14 +420,12 @@ out:
 /* Main login entry point
  *
  * portal: 0 for gateway login, 1 for portal login
- * pw_or_cookie_field: "alternate secret" field (see new_auth_form)
+ * alt_secret: "alternate secret" field (see new_auth_form)
  *
  */
-static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_cookie_field)
+static int gpst_login(struct openconnect_info *vpninfo, int portal, struct login_context *ctx)
 {
 	int result;
-
-	struct oc_auth_form *form = NULL;
 	struct oc_text_buf *request_body = buf_alloc();
 	const char *request_body_type = "application/x-www-form-urlencoded";
 	char *xml_buf = NULL, *orig_path;
@@ -428,19 +449,19 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 		vpninfo->urlpath = orig_path;
 
 		if (result >= 0)
-			result = gpst_xml_or_error(vpninfo, xml_buf, parse_prelogin_xml, NULL, &form);
+			result = gpst_xml_or_error(vpninfo, xml_buf, parse_prelogin_xml, NULL, ctx);
 		if (result)
 			goto out;
 
 	got_form:
 		/* process auth form */
-		result = process_auth_form(vpninfo, form);
+		result = process_auth_form(vpninfo, ctx->form);
 		if (result)
 			goto out;
 
 	replay_form:
 		/* generate token code if specified */
-		result = do_gen_tokencode(vpninfo, form);
+		result = do_gen_tokencode(vpninfo, ctx->form);
 		if (result) {
 			vpn_progress(vpninfo, PRG_ERR, _("Failed to generate OTP tokencode; disabling token\n"));
 			vpninfo->token_bypassed = 1;
@@ -455,9 +476,9 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 		append_opt(request_body, "computer", vpninfo->localname);
 		if (vpninfo->ip_info.addr)
 			append_opt(request_body, "preferred-ip", vpninfo->ip_info.addr);
-		if (form->auth_id && form->auth_id[0]!='_')
-			append_opt(request_body, "inputStr", form->auth_id);
-		append_form_opts(vpninfo, form, request_body);
+		if (ctx->form->auth_id && ctx->form->auth_id[0]!='_')
+			append_opt(request_body, "inputStr", ctx->form->auth_id);
+		append_form_opts(vpninfo, ctx->form, request_body);
 		if ((result = buf_error(request_body)))
 			goto out;
 
@@ -471,31 +492,34 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 		/* Result could be either a JavaScript challenge or XML */
 		if (result >= 0)
 			result = gpst_xml_or_error(vpninfo, xml_buf, portal ? parse_portal_xml : parse_login_xml,
-									   challenge_cb, &form);
-		if (result == -EAGAIN) {
-			/* New form is already populated from the challenge */
-			goto got_form;
-		} else if (result == -EACCES) {
+									   challenge_cb, ctx);
+		if (result == -EACCES) {
 			/* Invalid username/password; reuse same form, but blank */
-			nuke_opt_values(form->opts);
+			nuke_opt_values(ctx->form->opts);
 			goto got_form;
-		} else if (portal && result == 0) {
-			/* Portal login succeeded; reuse same credentials to login to gateway,
-			 * unless it was a challenge auth form, or used an alternative secret,
-			 * in which case we treat as a new form. */
-			portal = 0;
-			if (form->auth_id && form->auth_id[0] != '_')
+		} else {
+			/* Save successful username */
+			if (!ctx->username)
+				ctx->username = strdup(ctx->form->opts->_value);
+			if (result == -EAGAIN) {
+				/* New form is already populated from the challenge */
 				goto got_form;
-			else if (strcmp(form->opts->next->name, "passwd") != 0)
-				goto got_form;
-			else
-				goto replay_form;
-		} else
-			break;
+			} else if (portal && result == 0) {
+				/* Portal login succeeded; blindly retry same credentials on gateway,
+				 * unless it was a challenge auth form or alt-secret form.
+				 */
+				portal = 0;
+				if (ctx->form->auth_id[0] == '_' && ctx->alt_secret) {
+					goto replay_form;
+				else
+					goto new_form;
+				}
+			} else
+			  break;
+		}
 	}
 
 out:
-	free_auth_form(form);
 	buf_free(request_body);
 	free(xml_buf);
 	return result;
@@ -503,7 +527,7 @@ out:
 
 int gpst_obtain_cookie(struct openconnect_info *vpninfo)
 {
-	char *pw_or_cookie_field = NULL;
+	struct login_context ctx = { .username=NULL, .alt_secret=NULL, .form=NULL };
 	int result;
 
 	/* An alternate password/secret field may be specified in the "URL path" (or --usergroup).
@@ -512,29 +536,30 @@ int gpst_obtain_cookie(struct openconnect_info *vpninfo)
 	 *     /gateway:prelogin-cookie
 	 */
 	if (vpninfo->urlpath
-	    && (pw_or_cookie_field = strrchr(vpninfo->urlpath, ':'))!=NULL) {
-		*pw_or_cookie_field = '\0';
-		pw_or_cookie_field++;
+	    && (ctx.alt_secret = strrchr(vpninfo->urlpath, ':')) != NULL) {
+		*(ctx.alt_secret) = '\0';
+		ctx.alt_secret = strdup(ctx.alt_secret+1);
 	}
 
 	if (vpninfo->urlpath && (!strcmp(vpninfo->urlpath, "portal") || !strncmp(vpninfo->urlpath, "global-protect", 14))) {
 		/* assume the server is a portal */
-		return gpst_login(vpninfo, 1, pw_or_cookie_field);
+		result = gpst_login(vpninfo, 1, &ctx);
 	} else if (vpninfo->urlpath && (!strcmp(vpninfo->urlpath, "gateway") || !strncmp(vpninfo->urlpath, "ssl-vpn", 7))) {
 		/* assume the server is a gateway */
-		return gpst_login(vpninfo, 0, pw_or_cookie_field);
+		result = gpst_login(vpninfo, 0, &ctx);
 	} else {
 		/* first try handling it as a gateway, then a portal */
-		result = gpst_login(vpninfo, 0, pw_or_cookie_field);
+		result = gpst_login(vpninfo, 0, &ctx);
 		if (result == -EEXIST) {
-			/* XX: Don't we want to start by trying the same username/password the user just
-			   entered for the 'gateway' attempt? */
-			result = gpst_login(vpninfo, 1, pw_or_cookie_field);
+			result = gpst_login(vpninfo, 1, &ctx);
 			if (result == -EEXIST)
 				vpn_progress(vpninfo, PRG_ERR, _("Server is neither a GlobalProtect portal nor a gateway.\n"));
 		}
-		return result;
 	}
+	free(ctx.username);
+	free(ctx.alt_secret);
+	free_auth_form(ctx.form);
+	return result;
 }
 
 int gpst_bye(struct openconnect_info *vpninfo, const char *reason)
