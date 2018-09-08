@@ -139,16 +139,14 @@ static int parse_login_xml(struct openconnect_info *vpninfo, xmlNode *xml_node)
 		while (xml_node && xml_node->type != XML_ELEMENT_NODE)
 			xml_node = xml_node->next;
 
-		if (xml_node && !xmlnode_is_named(xml_node, "argument"))
-			goto err_out;
-		else if (xml_node) {
-			value = (char *)xmlNodeGetContent(xml_node);
+		if (xml_node && !xmlnode_get_val(xml_node, "argument", &value)) {
 			if (value && (!value[0] || !strcmp(value, "(null)") || !strcmp(value, "-1"))) {
 				free(value);
 				value = NULL;
 			}
 			xml_node = xml_node->next;
-		}
+		} else if (xml_node)
+			goto err_out;
 
 		if (arg->check && (!value || strcmp(value, arg->check))) {
 			vpn_progress(vpninfo, arg->err_missing ? PRG_ERR : PRG_DEBUG,
@@ -221,10 +219,10 @@ static int parse_portal_xml(struct openconnect_info *vpninfo, xmlNode *xml_node)
 	 */
 	if (xmlnode_is_named(xml_node, "policy")) {
 		for (x = xml_node->children, xml_node = NULL; x; x = x->next) {
-			if (xmlnode_is_named(x, "portal-name"))
-				portal = (char *)xmlNodeGetContent(x);
-			else if (xmlnode_is_named(x, "gateways"))
+			if (xmlnode_is_named(x, "gateways"))
 				xml_node = x;
+			else
+				xmlnode_get_val(x, "portal-name", &portal);
 		}
 	}
 
@@ -275,8 +273,7 @@ gateways:
 
 			xmlnode_get_prop(xml_node, "name", &choice->name);
 			for (x = xml_node->children; x; x=x->next)
-				if (xmlnode_is_named(x, "description")) {
-					choice->label = (char *)xmlNodeGetContent(x);
+				if (!xmlnode_get_val(x, "description", &choice->label)) {
 					if (vpninfo->write_new_config) {
 						buf_append(buf, "      <HostEntry><HostName>");
 						buf_append_xmlescaped(buf, choice->label);
