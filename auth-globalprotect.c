@@ -86,6 +86,9 @@ static struct oc_auth_form *new_auth_form(struct openconnect_info *vpninfo,
 	return form;
 }
 
+/* Callback function to create a new form from a challenge
+ *
+ */
 static int challenge_cb(struct openconnect_info *vpninfo, char *prompt, char *inputStr, void *cb_data)
 {
 	struct oc_auth_form **out_form = cb_data;
@@ -375,7 +378,7 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 		if (!form)
 			return -ENOMEM;
 
-		/* process auth form (username and password or challenge) */
+		/* process auth form */
 		result = process_auth_form(vpninfo, form);
 		if (result)
 			goto out;
@@ -414,7 +417,7 @@ static int gpst_login(struct openconnect_info *vpninfo, int portal, char *pw_or_
 			result = gpst_xml_or_error(vpninfo, xml_buf, portal ? parse_portal_xml : parse_login_xml,
 									   challenge_cb, &form);
 		if (result == -EAGAIN) {
-			/* We've already got the new form */
+			/* New form is already populated from the challenge */
 			continue;
 		} else if (result == -EACCES) {
 			/* Invalid username/password; reuse same form, but blank */
