@@ -67,8 +67,8 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 
 	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
 		if (!xmlnode_get_val(xml_node, "saml-auth-method", &s)) {
-			if (strcmp(s, "REDIRECT"))
-				vpn_progress(vpninfo, PRG_DEBUG, "Unexpected SAML method %s (expected REDIRECT)\n", s);
+			if (strcmp(s, "REDIRECT") && strcmp(s, "POST"))
+				vpn_progress(vpninfo, PRG_DEBUG, "Unknown SAML method %s (expected REDIRECT or POST)\n", s);
 		} else if (!xmlnode_get_val(xml_node, "saml-request", &s)) {
 			int len;
 			saml_path = openconnect_base64_decode(&len, s);
