@@ -58,34 +58,43 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 	struct login_context *ctx = cb_data;
 	struct oc_auth_form *form = ctx->form;
 	struct oc_form_opt *opt, *opt2;
-	char *prompt = NULL, *username_label = NULL, *password_label = NULL, *saml_path = NULL;
-	char *s = NULL;
+	char *prompt = NULL, *username_label = NULL, *password_label = NULL;
+	char *saml_method = NULL, *saml_path = NULL;
 	int result = 0;
 
 	if (!xmlnode_is_named(xml_node, "prelogin-response"))
 		goto out;
 
 	for (xml_node = xml_node->children; xml_node; xml_node = xml_node->next) {
-		if (!xmlnode_get_val(xml_node, "saml-auth-method", &s)) {
-			if (strcmp(s, "REDIRECT") && strcmp(s, "POST"))
-				vpn_progress(vpninfo, PRG_DEBUG, "Unknown SAML method %s (expected REDIRECT or POST)\n", s);
-		} else if (!xmlnode_get_val(xml_node, "saml-request", &s)) {
+		char *s = NULL;
+		if (!xmlnode_get_val(xml_node, "saml-request", &s)) {
 			int len;
 			saml_path = openconnect_base64_decode(&len, s);
 			if (len < 0) {
 				vpn_progress(vpninfo, PRG_ERR, "Could not decode SAML request as base64: %s\n", s);
+				free(s);
 				result = -EINVAL;
+				goto out;
 			}
+			free(s);
 			saml_path = realloc(saml_path, len+1);
 			saml_path[len] = '\0';
 		} else {
+			xmlnode_get_val(xml_node, "saml-auth-method", &saml_method);
 			xmlnode_get_val(xml_node, "authentication-message", &prompt);
 			xmlnode_get_val(xml_node, "username-label", &username_label);
 			xmlnode_get_val(xml_node, "password-label", &password_label);
 			/* XX: should we save the certificate username from <ccusername/> ? */
 		}
 	}
-	free(s);
+
+	/* XX: Alt-secret form field must be specified for SAML, because we can't autodetect it */
+	if ((saml_method || saml_path) && !ctx->alt_secret) {
+		vpn_progress(vpninfo, PRG_ERR, "SAML authentication via %s to %s is required.\n"
+					 "Must specify destination form field by appending :field_name to login URL.\n",
+					 saml_method, saml_path);
+		result = -EINVAL;
+	}
 
 	/* Replace old form */
 	free_auth_form(ctx->form);
@@ -96,7 +105,7 @@ static int parse_prelogin_xml(struct openconnect_info *vpninfo, xmlNode *xml_nod
 		result = -ENOMEM;
 		goto out;
 	}
-	if (saml_path && asprintf(&form->banner, _("SAML login is required. Visit this URL:\n\t%s"), saml_path) == 0)
+	if (saml_path && asprintf(&form->banner, _("SAML login is required via %s to this URL:\n\t%s"), saml_method, saml_path) == 0)
 		goto nomem;
 	form->message = prompt ? : strdup(_("Please enter your username and password"));
 	prompt = NULL;
@@ -143,6 +152,7 @@ out:
 	free(prompt);
 	free(username_label);
 	free(password_label);
+	free(saml_method);
 	free(saml_path);
 	return result;
 }
